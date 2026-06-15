@@ -242,6 +242,17 @@ pub enum AgentsCommand {
     Report(ClientArgs),
     /// Install or reinstall an agent.
     Install(ApiInstallAgentArgs),
+    /// Show subscription usage and plan info for an agent.
+    Usage(ApiAgentUsageArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ApiAgentUsageArgs {
+    agent: String,
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    client: ClientArgs,
 }
 
 #[derive(Args, Debug)]
@@ -550,7 +561,52 @@ fn run_agents(command: &AgentsCommand, cli: &CliConfig) -> Result<(), CliError> 
             )?;
             write_stdout_line(&serde_json::to_string_pretty(&result)?)
         }
+        AgentsCommand::Usage(args) => run_agents_usage(args, cli),
     }
+}
+
+fn run_agents_usage(args: &ApiAgentUsageArgs, cli: &CliConfig) -> Result<(), CliError> {
+    let ctx = ClientContext::new(cli, &args.client)?;
+    let response = ctx.get(&format!("{API_PREFIX}/agents/{}/usage", args.agent))?;
+    let status = response.status();
+    let text = response.text()?;
+
+    if !status.is_success() {
+        print_error_body(&text)?;
+        return Err(CliError::HttpStatus(status));
+    }
+
+    if args.json {
+        return write_stdout_line(&text);
+    }
+
+    let parsed: Value = serde_json::from_str(&text)?;
+    print_usage_pretty(&parsed)
+}
+
+fn print_usage_pretty(v: &Value) -> Result<(), CliError> {
+    let plan = &v["plan"];
+    write_stdout_line(&format!(
+        "Plan: {} ({}, seat {}) - {}",
+        plan["organizationName"].as_str().unwrap_or("?"),
+        plan["organizationType"].as_str().unwrap_or("?"),
+        plan["seatTier"].as_str().unwrap_or("?"),
+        plan["subscriptionStatus"].as_str().unwrap_or("?"),
+    ))?;
+    if let Some(windows) = v["windows"].as_array() {
+        for w in windows {
+            let key = w["key"].as_str().unwrap_or("?");
+            let used = w["utilizationPct"].as_f64().unwrap_or(0.0);
+            let left = w["remainingPct"].as_f64().unwrap_or(0.0);
+            let filled = ((used / 5.0).round() as i64).clamp(0, 20) as usize;
+            let bar: String = "#".repeat(filled) + &"-".repeat(20 - filled);
+            let resets = w["resetsAt"].as_str().unwrap_or("");
+            write_stdout_line(&format!(
+                "  {key:10} used {used:5.1}%  left {left:5.1}%  [{bar}]  resets: {resets}"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

@@ -92,9 +92,8 @@ pub fn extract_claude_credentials(
             };
             let access = read_string_field(&data, &["claudeAiOauth", "accessToken"]);
             if let Some(token) = access {
-                if let Some(expires_at) = read_string_field(&data, &["claudeAiOauth", "expiresAt"])
-                {
-                    if is_expired_rfc3339(&expires_at) {
+                if let Some(expires_at) = read_value_field(&data, &["claudeAiOauth", "expiresAt"]) {
+                    if is_expired(expires_at) {
                         continue;
                     }
                 }
@@ -388,11 +387,42 @@ fn current_epoch_millis() -> i64 {
     (now.unix_timestamp() * 1000) + (now.millisecond() as i64)
 }
 
-fn is_expired_rfc3339(value: &str) -> bool {
-    match OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339) {
-        Ok(expiry) => expiry < OffsetDateTime::now_utc(),
-        Err(_) => false,
+fn read_value_field<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
     }
+    Some(current)
+}
+
+/// Returns true if the given OAuth expiry value is in the past.
+///
+/// Claude Code writes `expiresAt` as an epoch-millisecond number, while other
+/// configs may use an RFC3339 string (or a millisecond value stored as a
+/// string). All of these forms are handled. Values that cannot be interpreted
+/// are treated as not expired so we never discard credentials we can't judge.
+fn is_expired(value: &Value) -> bool {
+    match value {
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .map(|millis| millis < current_epoch_millis())
+            .unwrap_or(false),
+        Value::String(s) => is_expired_timestamp_str(s),
+        _ => false,
+    }
+}
+
+fn is_expired_timestamp_str(value: &str) -> bool {
+    if let Ok(expiry) =
+        OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+    {
+        return expiry < OffsetDateTime::now_utc();
+    }
+    if let Ok(millis) = value.parse::<i64>() {
+        return millis < current_epoch_millis();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -523,5 +553,72 @@ mod tests {
                 assert_eq!(anthropic.auth_type, AuthType::ApiKey);
             },
         );
+    }
+
+    fn write_claude_oauth(home: &PathBuf, expires_at: serde_json::Value) {
+        let dir = home.join(".claude");
+        fs::create_dir_all(&dir).expect("failed to create .claude dir");
+        let body = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-test",
+                "expiresAt": expires_at,
+            }
+        });
+        fs::write(dir.join(".credentials.json"), body.to_string())
+            .expect("failed to write credentials file");
+    }
+
+    fn oauth_options(home: PathBuf) -> CredentialExtractionOptions {
+        CredentialExtractionOptions {
+            home_dir: Some(home),
+            include_oauth: true,
+        }
+    }
+
+    #[test]
+    fn claude_oauth_rejected_when_numeric_millis_expired() {
+        let home = empty_home_dir();
+        let past = current_epoch_millis() - 3_600_000; // 1 hour ago
+        write_claude_oauth(&home, serde_json::json!(past));
+        assert!(
+            extract_claude_credentials(&oauth_options(home)).is_none(),
+            "expired numeric (millisecond) expiresAt must be rejected"
+        );
+    }
+
+    #[test]
+    fn claude_oauth_accepted_when_numeric_millis_valid() {
+        let home = empty_home_dir();
+        let future = current_epoch_millis() + 3_600_000; // 1 hour ahead
+        write_claude_oauth(&home, serde_json::json!(future));
+        let creds = extract_claude_credentials(&oauth_options(home))
+            .expect("valid numeric expiresAt should yield oauth credentials");
+        assert_eq!(creds.auth_type, AuthType::Oauth);
+        assert_eq!(creds.api_key, "sk-ant-oat01-test");
+    }
+
+    #[test]
+    fn claude_oauth_rejected_when_rfc3339_expired() {
+        let home = empty_home_dir();
+        write_claude_oauth(&home, serde_json::json!("2000-01-01T00:00:00Z"));
+        assert!(
+            extract_claude_credentials(&oauth_options(home)).is_none(),
+            "expired RFC3339 expiresAt must be rejected"
+        );
+    }
+
+    #[test]
+    fn claude_oauth_accepted_when_expiresat_missing() {
+        let home = empty_home_dir();
+        let dir = home.join(".claude");
+        fs::create_dir_all(&dir).expect("failed to create .claude dir");
+        fs::write(
+            dir.join(".credentials.json"),
+            serde_json::json!({"claudeAiOauth": {"accessToken": "sk-ant-oat01-test"}}).to_string(),
+        )
+        .expect("failed to write credentials file");
+        let creds = extract_claude_credentials(&oauth_options(home))
+            .expect("missing expiresAt should not discard credentials");
+        assert_eq!(creds.auth_type, AuthType::Oauth);
     }
 }

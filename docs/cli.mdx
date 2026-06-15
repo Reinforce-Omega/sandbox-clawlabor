@@ -236,6 +236,7 @@ Shared option:
 sandbox-agent api agents list [--endpoint <URL>]
 sandbox-agent api agents report [--endpoint <URL>]
 sandbox-agent api agents install <AGENT> [--reinstall] [--endpoint <URL>]
+sandbox-agent api agents usage <AGENT> [--json] [--endpoint <URL>]
 ```
 
 #### api agents list
@@ -295,4 +296,19 @@ See individual agent pages (e.g. [Claude](/agents/claude), [Codex](/agents/codex
 
 ```bash
 sandbox-agent api agents install codex --reinstall
+```
+
+#### api agents usage
+
+Show the Claude subscription usage for an agent, including the 5-hour and weekly usage windows plus plan information. Only the `claude` agent is supported.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--json` | (off) | Print the raw JSON response instead of the formatted summary |
+| `-e, --endpoint <URL>` | `http://127.0.0.1:2468` | Target server |
+| `-t, --token <TOKEN>` | | Require/use bearer auth |
+| `-n, --no-token` | | Disable auth |
+
+```bash
+sandbox-agent api agents usage claude --endpoint http://127.0.0.1:2468 --no-token
 ```

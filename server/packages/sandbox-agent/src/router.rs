@@ -23,6 +23,7 @@ use sandbox_agent_agent_management::agents::{
 use sandbox_agent_agent_management::credentials::{
     extract_all_credentials, CredentialExtractionOptions,
 };
+use sandbox_agent_agent_credentials::AuthType;
 use sandbox_agent_error::{ErrorType, ProblemDetails, SandboxError};
 use sandbox_agent_opencode_adapter::{build_opencode_router, OpenCodeAdapterConfig};
 use sandbox_agent_opencode_server_manager::{OpenCodeServerManager, OpenCodeServerManagerConfig};
@@ -37,6 +38,7 @@ use tracing::Span;
 use utoipa::{IntoParams, Modify, OpenApi, ToSchema};
 
 use crate::acp_proxy_runtime::{AcpProxyRuntime, ProxyPostOutcome};
+use crate::claude_usage::{self, ClaudeUsageResponse, UsageError};
 use crate::desktop_errors::DesktopProblem;
 use crate::desktop_runtime::DesktopRuntime;
 use crate::desktop_types::*;
@@ -261,6 +263,7 @@ pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>)
         .route("/desktop/stream/signaling", get(get_v1_desktop_stream_ws))
         .route("/agents", get(get_v1_agents))
         .route("/agents/:agent", get(get_v1_agent))
+        .route("/agents/:agent/usage", get(get_v1_agent_usage))
         .route("/agents/:agent/install", post(post_v1_agent_install))
         .route("/fs/entries", get(get_v1_fs_entries))
         .route("/fs/file", get(get_v1_fs_file).put(put_v1_fs_file))
@@ -448,6 +451,7 @@ pub async fn shutdown_servers(state: &Arc<AppState>) {
         get_v1_desktop_stream_ws,
         get_v1_agents,
         get_v1_agent,
+        get_v1_agent_usage,
         post_v1_agent_install,
         get_v1_fs_entries,
         get_v1_fs_file,
@@ -529,6 +533,9 @@ pub async fn shutdown_servers(state: &Arc<AppState>) {
             AgentCapabilities,
             AgentInfo,
             AgentListResponse,
+            claude_usage::ClaudeUsageResponse,
+            claude_usage::PlanInfo,
+            claude_usage::UsageWindow,
             AgentInstallRequest,
             AgentInstallArtifact,
             AgentInstallResponse,
@@ -1722,6 +1729,110 @@ async fn get_v1_agent(
     }
 
     Ok(Json(info))
+}
+
+/// Build a `problem+json` `ApiError` with an explicit status/title/detail.
+fn usage_problem(status: u16, title: &str, detail: String) -> ApiError {
+    ApiError::Problem(ProblemDetails {
+        type_: ErrorType::InvalidRequest.as_urn().to_string(),
+        title: title.to_string(),
+        status,
+        detail: Some(detail),
+        instance: None,
+        extensions: serde_json::Map::new(),
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/agents/{agent}/usage",
+    tag = "v1",
+    params(
+        ("agent" = String, Path, description = "Agent id (only `claude` is supported)")
+    ),
+    responses(
+        (status = 200, description = "Claude subscription usage and plan info", body = ClaudeUsageResponse),
+        (status = 400, description = "Unknown agent or non-OAuth credential", body = ProblemDetails),
+        (status = 401, description = "Authentication required or token expired", body = ProblemDetails),
+        (status = 501, description = "Usage not supported for this agent", body = ProblemDetails),
+        (status = 502, description = "Failed to contact or parse the upstream usage service", body = ProblemDetails),
+        (status = 504, description = "Timed out contacting the upstream usage service", body = ProblemDetails)
+    )
+)]
+/// Get Claude subscription usage and plan info.
+///
+/// Fetches current rate-limit window utilization and subscription/plan details
+/// for the Claude agent using the resolved Anthropic OAuth (subscription) credential.
+/// Only the `claude` agent is supported; other agents return `501`.
+async fn get_v1_agent_usage(
+    Path(agent): Path<String>,
+) -> Result<Json<ClaudeUsageResponse>, ApiError> {
+    let agent_id = AgentId::parse(&agent).ok_or_else(|| SandboxError::UnsupportedAgent {
+        agent: agent.clone(),
+    })?;
+
+    if agent_id != AgentId::Claude {
+        return Err(usage_problem(
+            501,
+            "Usage Not Supported",
+            format!("usage is not supported for agent '{agent}'"),
+        ));
+    }
+
+    let credentials = tokio::task::spawn_blocking(move || {
+        extract_all_credentials(&CredentialExtractionOptions::new())
+    })
+    .await
+    .map_err(|err| SandboxError::StreamError {
+        message: format!("failed to resolve credentials: {err}"),
+    })?;
+
+    let Some(cred) = credentials.anthropic else {
+        return Err(usage_problem(
+            401,
+            "Authentication Required",
+            "no Anthropic credentials available".to_string(),
+        ));
+    };
+
+    if cred.auth_type != AuthType::Oauth {
+        return Err(usage_problem(
+            400,
+            "Invalid Request",
+            "usage requires a Claude subscription (OAuth) credential".to_string(),
+        ));
+    }
+
+    match claude_usage::fetch_claude_usage(&cred.api_key).await {
+        Ok(usage) => Ok(Json(usage)),
+        Err(err) => Err(match err {
+            UsageError::Unauthorized => usage_problem(
+                401,
+                "Authentication Required",
+                "Claude subscription token expired or invalid".to_string(),
+            ),
+            UsageError::Upstream { status } => usage_problem(
+                502,
+                "Bad Gateway",
+                format!("Anthropic returned an unexpected status: {status}"),
+            ),
+            UsageError::Timeout => usage_problem(
+                504,
+                "Timeout",
+                "timed out contacting Anthropic".to_string(),
+            ),
+            UsageError::Transport(msg) => usage_problem(
+                502,
+                "Bad Gateway",
+                format!("failed to contact Anthropic: {msg}"),
+            ),
+            UsageError::Parse(msg) => usage_problem(
+                502,
+                "Bad Gateway",
+                format!("failed to parse Anthropic response: {msg}"),
+            ),
+        }),
+    }
 }
 
 // TODO: Re-enable ACP config probing once agent processes reliably return
