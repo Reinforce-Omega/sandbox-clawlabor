@@ -274,6 +274,25 @@ impl AdapterRuntime {
         (replay, self.sender.subscribe())
     }
 
+    /// Inject a synthetic notification into the SSE stream (broadcast + replay ring),
+    /// as if it had come from the agent. Used by the proxy to answer locally-handled
+    /// slash commands (e.g. /usage) without forwarding to the agent.
+    pub async fn inject_notification(&self, payload: Value) {
+        let seq = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let message = StreamMessage {
+            sequence: seq,
+            payload,
+        };
+        {
+            let mut guard = self.ring.lock().await;
+            guard.push_back(message.clone());
+            while guard.len() > RING_BUFFER_SIZE {
+                guard.pop_front();
+            }
+        }
+        let _ = self.sender.send(message);
+    }
+
     pub async fn sse_stream(
         self: Arc<Self>,
         last_event_id: Option<u64>,
@@ -622,4 +641,53 @@ impl AdapterRuntime {
 
 fn id_key(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::LaunchSpec;
+
+    /// Spawns a real runtime backed by `cat`, a long-lived child that reads
+    /// stdin and only echoes back on EOF, so it does not emit any stdout
+    /// notifications of its own during the test.
+    async fn cat_runtime() -> AdapterRuntime {
+        let launch = LaunchSpec {
+            program: "cat".into(),
+            args: Vec::new(),
+            env: HashMap::new(),
+        };
+        AdapterRuntime::start(launch, Duration::from_secs(5))
+            .await
+            .expect("spawn cat runtime")
+    }
+
+    #[tokio::test]
+    async fn inject_notification_is_observable_in_replay_ring() {
+        let runtime = cat_runtime().await;
+
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "_sandboxagent/usage",
+            "params": { "hello": "world" }
+        });
+        runtime.inject_notification(payload.clone()).await;
+
+        // Replay from the start should include the injected notification with a
+        // monotonically-assigned sequence.
+        let (replay, _rx) = runtime.subscribe(None).await;
+        assert_eq!(replay.len(), 1, "expected exactly one replayed message");
+        let (sequence, replayed) = &replay[0];
+        assert_eq!(*sequence, 1, "first injected message gets sequence 1");
+        assert_eq!(replayed, &payload);
+
+        // Replaying after that sequence should yield nothing.
+        let (replay_after, _rx) = runtime.subscribe(Some(*sequence)).await;
+        assert!(
+            replay_after.is_empty(),
+            "no messages should remain after last sequence"
+        );
+
+        runtime.shutdown().await;
+    }
 }

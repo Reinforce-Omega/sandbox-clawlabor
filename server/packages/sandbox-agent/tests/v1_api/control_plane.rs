@@ -19,6 +19,36 @@ async fn v1_health_removed_legacy_and_opencode_unmounted() {
 }
 
 #[tokio::test]
+async fn usage_returns_501_for_non_claude_agent() {
+    let test_app = TestApp::new(AuthConfig::disabled());
+
+    let (status, _, _body) = send_request(
+        &test_app.app,
+        Method::GET,
+        "/v1/agents/codex/usage",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn usage_returns_400_for_unknown_agent() {
+    let test_app = TestApp::new(AuthConfig::disabled());
+
+    let (status, _, _body) = send_request(
+        &test_app.app,
+        Method::GET,
+        "/v1/agents/bogus/usage",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn v1_auth_enforced_when_token_configured() {
     let test_app = TestApp::new(AuthConfig::with_token("secret-token".to_string()));
 

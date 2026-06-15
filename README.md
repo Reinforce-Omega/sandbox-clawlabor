@@ -210,6 +210,45 @@ sandbox-agent credentials extract-env --export
 
 This prints environment variables for your OpenAI/Anthropic/etc API keys to test with Sandbox Agent SDK.
 
+## Clawlabor (custom build)
+
+This repo is also published as a slim, prebuilt image under `ryanxdocker/sandbox-clawlabor`, with a few additions on top of upstream Sandbox Agent.
+
+### Run the published image
+
+The image bundles the server, the Inspector UI, and the Claude, Codex, and OpenCode agents (linux/arm64).
+
+```bash
+docker run -d -p 2468:2468 \
+  -e CLAUDE_CODE_OAUTH_TOKEN="<your Claude subscription token>" \
+  ryanxdocker/sandbox-clawlabor:latest \
+  server --no-token --host 0.0.0.0 --port 2468
+```
+
+Then open the Inspector at `http://localhost:2468/ui/`. Tags: `latest`, `base`, `0.1.0`.
+
+Mint a long-lived subscription token with `claude setup-token` for `CLAUDE_CODE_OAUTH_TOKEN`, or pass a provider API key (e.g. `ANTHROPIC_API_KEY`) instead.
+
+### `/usage` — Claude subscription usage
+
+For the Claude agent, this build surfaces your subscription usage (the rolling 5-hour and weekly windows plus plan info):
+
+- **In chat:** type `/usage` in the Inspector chat and it returns the usage as an assistant reply. (`/usage` is a terminal-only command the headless agent cannot render, so the server handles it.)
+- **HTTP:** `GET /v1/agents/{agent}/usage` (only `claude` is supported; other agents return 501).
+- **CLI:** `sandbox-agent api agents usage claude --endpoint http://127.0.0.1:2468 --no-token` (add `--json` for raw output).
+
+### Local dev loop
+
+`scripts/dev-docker.sh` is a fast build/run loop: it swaps a debug build onto a prebuilt base, so Rust-only changes rebuild in a minute or two.
+
+```bash
+scripts/dev-docker.sh base    # build the slim base (release + selected agents); one-time
+scripts/dev-docker.sh up      # build the dev image + (re)start the container on :2468
+scripts/dev-docker.sh down    # stop and remove the container
+```
+
+The base is defined by `docker/runtime/Dockerfile.clawlabor-base` (only the agents you use are baked in; edit the `install-agent` lines to change the set). The dev image is `docker/runtime/Dockerfile.devfast`. The token is read from `$CLAUDE_CODE_OAUTH_TOKEN` or the macOS keychain; set `PLATFORM=linux/amd64` on Intel machines.
+
 ## FAQ
 
 <details>

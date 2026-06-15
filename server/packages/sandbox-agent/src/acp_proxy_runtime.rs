@@ -134,6 +134,10 @@ impl AcpProxyRuntime {
             "acp_proxy: instance resolved"
         );
 
+        if let Some(cmd) = crate::slash_commands::detect(instance.agent, &payload) {
+            return self.handle_slash_command(&instance, cmd).await;
+        }
+
         let payload = normalize_payload_for_agent(instance.agent, payload);
 
         match instance.runtime.post(payload).await {
@@ -430,6 +434,50 @@ impl AcpProxyRuntime {
         }
         self.inner.agent_manager.is_installed(agent)
     }
+
+    async fn handle_slash_command(
+        &self,
+        instance: &ProxyInstance,
+        cmd: crate::slash_commands::SlashCommand,
+    ) -> Result<ProxyPostOutcome, SandboxError> {
+        let crate::slash_commands::SlashCommand::Usage {
+            session_id,
+            request_id,
+        } = cmd;
+        let text = match self.resolve_anthropic_oauth_token().await {
+            Some(token) => match crate::claude_usage::fetch_claude_usage(&token).await {
+                Ok(usage) => crate::slash_commands::format_usage(&usage),
+                Err(err) => format!("⚠️ Could not fetch usage: {}", describe_usage_error(&err)),
+            },
+            None => "⚠️ /usage requires a Claude subscription (OAuth) login; no subscription credential is available.".to_string(),
+        };
+        instance
+            .runtime
+            .inject_notification(crate::slash_commands::assistant_message_update(
+                &session_id,
+                &text,
+            ))
+            .await;
+        Ok(ProxyPostOutcome::Response(
+            crate::slash_commands::end_turn_response(&request_id),
+        ))
+    }
+
+    async fn resolve_anthropic_oauth_token(&self) -> Option<String> {
+        use sandbox_agent_agent_credentials::{
+            extract_all_credentials, AuthType, CredentialExtractionOptions,
+        };
+        let creds =
+            tokio::task::spawn_blocking(|| extract_all_credentials(&CredentialExtractionOptions::new()))
+                .await
+                .ok()?;
+        let cred = creds.anthropic?;
+        if cred.auth_type == AuthType::Oauth {
+            Some(cred.api_key)
+        } else {
+            None
+        }
+    }
 }
 
 impl AcpDispatch for AcpProxyRuntime {
@@ -472,6 +520,17 @@ impl AcpDispatch for AcpProxyRuntime {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         let server_id = server_id.to_string();
         Box::pin(async move { self.delete(&server_id).await.map_err(|err| err.to_string()) })
+    }
+}
+
+fn describe_usage_error(err: &crate::claude_usage::UsageError) -> String {
+    use crate::claude_usage::UsageError;
+    match err {
+        UsageError::Unauthorized => "token expired or invalid".to_string(),
+        UsageError::Upstream { status } => format!("Anthropic returned {status}"),
+        UsageError::Timeout => "timed out".to_string(),
+        UsageError::Transport(m) => m.clone(),
+        UsageError::Parse(m) => m.clone(),
     }
 }
 
