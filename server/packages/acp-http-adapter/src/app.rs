@@ -107,6 +107,17 @@ fn map_error(err: AdapterError) -> Response {
             };
             problem(StatusCode::BAD_GATEWAY, "agent_exited", &detail)
         }
+        AdapterError::ClaudeSessionLimit { exit_code, stderr } => {
+            let detail = format!(
+                "Claude session limit reached (exit_code: {:?}, stderr: {})",
+                exit_code, stderr
+            );
+            problem(
+                StatusCode::TOO_MANY_REQUESTS,
+                "claude_session_limit",
+                &detail,
+            )
+        }
         AdapterError::Write(write) => problem(
             StatusCode::BAD_GATEWAY,
             "write_failed",

@@ -2,7 +2,8 @@ use std::io;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{env, fs};
 
 use futures::StreamExt;
 use reqwest::{Client, StatusCode};
@@ -149,6 +150,50 @@ async fn sse_request_and_client_response_flow() {
     );
 }
 
+#[tokio::test]
+async fn claude_session_limit_exit_returns_429_problem() {
+    let script_path = write_temp_executable(
+        "claude-limit-agent",
+        "#!/usr/bin/env sh\n\
+         echo \"You've hit your session limit · resets 8:40pm (Asia/Shanghai)\" >&2\n\
+         exit 1\n",
+    )
+    .expect("write fake agent");
+    let adapter = spawn_adapter_with_command(script_path.to_string_lossy().as_ref(), &[])
+        .expect("spawn adapter");
+    wait_for_health(&adapter.base_url)
+        .await
+        .expect("wait for health");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = Client::new();
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "session/prompt",
+        "params": {}
+    });
+    let response = client
+        .post(format!("{}/v1/rpc", adapter.base_url))
+        .json(&payload)
+        .send()
+        .await
+        .expect("post rpc");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = response.json().await.expect("problem json");
+    assert_eq!(body["title"], "claude_session_limit");
+    assert_eq!(body["status"], 429);
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("You've hit your session limit"),
+        "detail should include Claude limit stderr: {body:?}"
+    );
+}
+
 struct SseReader {
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
     buffer: Vec<u8>,
@@ -243,9 +288,6 @@ impl SseReader {
 }
 
 fn spawn_adapter() -> io::Result<AdapterHandle> {
-    let port = pick_port()?;
-    let base_url = format!("http://127.0.0.1:{port}");
-
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
         .ancestors()
@@ -254,38 +296,45 @@ fn spawn_adapter() -> io::Result<AdapterHandle> {
         .to_path_buf();
     let mock_agent_js = workspace_root.join("examples/mock-acp-agent/dist/index.js");
 
+    spawn_adapter_with_command("node", &[mock_agent_js.to_string_lossy().to_string()])
+}
+
+fn spawn_adapter_with_command(cmd: &str, args: &[String]) -> io::Result<AdapterHandle> {
+    let port = pick_port()?;
+    let base_url = format!("http://127.0.0.1:{port}");
+
     let registry_blob = json!({
         "id": "mock-acp-agent",
         "distribution": {
             "binary": {
                 "linux-x86_64": {
-                    "cmd": "node",
-                    "args": [mock_agent_js.to_string_lossy()],
+                    "cmd": cmd,
+                    "args": args,
                     "env": {}
                 },
                 "linux-aarch64": {
-                    "cmd": "node",
-                    "args": [mock_agent_js.to_string_lossy()],
+                    "cmd": cmd,
+                    "args": args,
                     "env": {}
                 },
                 "darwin-x86_64": {
-                    "cmd": "node",
-                    "args": [mock_agent_js.to_string_lossy()],
+                    "cmd": cmd,
+                    "args": args,
                     "env": {}
                 },
                 "darwin-aarch64": {
-                    "cmd": "node",
-                    "args": [mock_agent_js.to_string_lossy()],
+                    "cmd": cmd,
+                    "args": args,
                     "env": {}
                 },
                 "windows-x86_64": {
-                    "cmd": "node",
-                    "args": [mock_agent_js.to_string_lossy()],
+                    "cmd": cmd,
+                    "args": args,
                     "env": {}
                 },
                 "windows-aarch64": {
-                    "cmd": "node",
-                    "args": [mock_agent_js.to_string_lossy()],
+                    "cmd": cmd,
+                    "args": args,
                     "env": {}
                 }
             }
@@ -306,6 +355,23 @@ fn spawn_adapter() -> io::Result<AdapterHandle> {
         .spawn()?;
 
     Ok(AdapterHandle { child, base_url })
+}
+
+fn write_temp_executable(name: &str, body: &str) -> io::Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = env::temp_dir().join(format!("{name}-{}-{}.sh", std::process::id(), nanos));
+    fs::write(&path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&path, perms)?;
+    }
+    Ok(path)
 }
 
 fn pick_port() -> io::Result<u16> {

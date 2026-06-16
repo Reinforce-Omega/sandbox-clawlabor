@@ -39,6 +39,11 @@ pub enum AdapterError {
         exit_code: Option<i32>,
         stderr: Option<String>,
     },
+    #[error("claude session limit reached")]
+    ClaudeSessionLimit {
+        exit_code: Option<i32>,
+        stderr: String,
+    },
     #[error("timeout waiting for response")]
     Timeout,
 }
@@ -174,6 +179,16 @@ impl AdapterRuntime {
                     "post: failed to write to agent stdin"
                 );
                 self.pending.lock().await.remove(&key);
+                if let Some((exit_code, stderr)) = self.try_process_exit_info().await {
+                    tracing::error!(
+                        method = %method,
+                        id = %key,
+                        exit_code = ?exit_code,
+                        stderr = ?stderr,
+                        "post: agent process exited before stdin write completed"
+                    );
+                    return Err(classify_agent_exit(exit_code, stderr));
+                }
                 return Err(err);
             }
             let write_ms = write_start.elapsed().as_millis() as u64;
@@ -214,7 +229,7 @@ impl AdapterRuntime {
                             stderr = ?stderr,
                             "post: agent process exited before response channel completed"
                         );
-                        return Err(AdapterError::Exited { exit_code, stderr });
+                        return Err(classify_agent_exit(exit_code, stderr));
                     }
                     Err(AdapterError::Timeout)
                 }
@@ -239,7 +254,7 @@ impl AdapterRuntime {
                             stderr = ?stderr,
                             "post: agent process exited before timeout completed"
                         );
-                        return Err(AdapterError::Exited { exit_code, stderr });
+                        return Err(classify_agent_exit(exit_code, stderr));
                     }
                     Err(AdapterError::Timeout)
                 }
@@ -643,6 +658,30 @@ fn id_key(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
+fn classify_agent_exit(exit_code: Option<i32>, stderr: Option<String>) -> AdapterError {
+    if let Some(stderr) = stderr {
+        if is_claude_session_limit(&stderr) {
+            return AdapterError::ClaudeSessionLimit { exit_code, stderr };
+        }
+        return AdapterError::Exited {
+            exit_code,
+            stderr: Some(stderr),
+        };
+    }
+
+    AdapterError::Exited {
+        exit_code,
+        stderr: None,
+    }
+}
+
+pub fn is_claude_session_limit(stderr: &str) -> bool {
+    let normalized = stderr.to_ascii_lowercase();
+    normalized.contains("you've hit your session limit")
+        || normalized.contains("you have hit your session limit")
+        || normalized.contains("session limit")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,5 +728,23 @@ mod tests {
         );
 
         runtime.shutdown().await;
+    }
+
+    #[test]
+    fn detects_claude_session_limit_stderr() {
+        assert!(is_claude_session_limit(
+            "You've hit your session limit · resets 8:40pm (Asia/Shanghai)"
+        ));
+        assert!(matches!(
+            classify_agent_exit(
+                Some(1),
+                Some("You've hit your session limit · resets 8:40pm".to_string())
+            ),
+            AdapterError::ClaudeSessionLimit {
+                exit_code: Some(1),
+                ..
+            }
+        ));
+        assert!(!is_claude_session_limit("some unrelated stderr"));
     }
 }
