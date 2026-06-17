@@ -13,6 +13,7 @@ pub enum ErrorType {
     AgentNotInstalled,
     InstallFailed,
     AgentProcessExited,
+    ClaudeSessionLimit,
     TokenInvalid,
     PermissionDenied,
     NotAcceptable,
@@ -34,6 +35,7 @@ impl ErrorType {
             Self::AgentNotInstalled => "urn:sandbox-agent:error:agent_not_installed",
             Self::InstallFailed => "urn:sandbox-agent:error:install_failed",
             Self::AgentProcessExited => "urn:sandbox-agent:error:agent_process_exited",
+            Self::ClaudeSessionLimit => "urn:sandbox-agent:error:claude_session_limit",
             Self::TokenInvalid => "urn:sandbox-agent:error:token_invalid",
             Self::PermissionDenied => "urn:sandbox-agent:error:permission_denied",
             Self::NotAcceptable => "urn:sandbox-agent:error:not_acceptable",
@@ -55,6 +57,7 @@ impl ErrorType {
             Self::AgentNotInstalled => "Agent Not Installed",
             Self::InstallFailed => "Install Failed",
             Self::AgentProcessExited => "Agent Process Exited",
+            Self::ClaudeSessionLimit => "Claude Session Limit Reached",
             Self::TokenInvalid => "Token Invalid",
             Self::PermissionDenied => "Permission Denied",
             Self::NotAcceptable => "Not Acceptable",
@@ -76,6 +79,7 @@ impl ErrorType {
             Self::AgentNotInstalled => 404,
             Self::InstallFailed => 500,
             Self::AgentProcessExited => 500,
+            Self::ClaudeSessionLimit => 429,
             Self::TokenInvalid => 401,
             Self::PermissionDenied => 403,
             Self::NotAcceptable => 406,
@@ -151,6 +155,12 @@ pub enum SandboxError {
         exit_code: Option<i32>,
         stderr: Option<String>,
     },
+    #[error("claude session limit reached: {agent}")]
+    ClaudeSessionLimit {
+        agent: String,
+        exit_code: Option<i32>,
+        stderr: String,
+    },
     #[error("token invalid")]
     TokenInvalid { message: Option<String> },
     #[error("permission denied")]
@@ -182,6 +192,7 @@ impl SandboxError {
             Self::AgentNotInstalled { .. } => ErrorType::AgentNotInstalled,
             Self::InstallFailed { .. } => ErrorType::InstallFailed,
             Self::AgentProcessExited { .. } => ErrorType::AgentProcessExited,
+            Self::ClaudeSessionLimit { .. } => ErrorType::ClaudeSessionLimit,
             Self::TokenInvalid { .. } => ErrorType::TokenInvalid,
             Self::PermissionDenied { .. } => ErrorType::PermissionDenied,
             Self::NotAcceptable { .. } => ErrorType::NotAcceptable,
@@ -244,6 +255,21 @@ impl SandboxError {
                         Some(Value::Object(map))
                     },
                 )
+            }
+            Self::ClaudeSessionLimit {
+                agent,
+                exit_code,
+                stderr,
+            } => {
+                let mut map = Map::new();
+                if let Some(code) = exit_code {
+                    map.insert(
+                        "exitCode".to_string(),
+                        Value::Number(serde_json::Number::from(*code as i64)),
+                    );
+                }
+                map.insert("stderr".to_string(), Value::String(stderr.clone()));
+                (Some(agent.clone()), None, Some(Value::Object(map)))
             }
             Self::TokenInvalid { message } => {
                 let details = message.as_ref().map(|msg| {

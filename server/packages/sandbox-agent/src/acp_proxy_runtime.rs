@@ -467,10 +467,11 @@ impl AcpProxyRuntime {
         use sandbox_agent_agent_credentials::{
             extract_all_credentials, AuthType, CredentialExtractionOptions,
         };
-        let creds =
-            tokio::task::spawn_blocking(|| extract_all_credentials(&CredentialExtractionOptions::new()))
-                .await
-                .ok()?;
+        let creds = tokio::task::spawn_blocking(|| {
+            extract_all_credentials(&CredentialExtractionOptions::new())
+        })
+        .await
+        .ok()?;
         let cred = creds.anthropic?;
         if cred.auth_type == AuthType::Oauth {
             Some(cred.api_key)
@@ -569,6 +570,15 @@ fn map_adapter_error(err: AdapterError, agent: Option<AgentId>) -> SandboxError 
                         )
                     },
                 }
+            }
+        }
+        AdapterError::ClaudeSessionLimit { exit_code, stderr } => {
+            SandboxError::ClaudeSessionLimit {
+                agent: agent
+                    .map(|agent| agent.as_str().to_string())
+                    .unwrap_or_else(|| "claude".to_string()),
+                exit_code,
+                stderr,
             }
         }
         AdapterError::Spawn(error) => SandboxError::StreamError {
