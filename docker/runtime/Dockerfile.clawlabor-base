@@ -169,12 +169,38 @@ USER sandbox
 WORKDIR /home/sandbox
 
 # --- Agents baked into the base ---
-# Installed in a single layer so the npm download cache can be removed in the
-# same layer (leaving it behind would add ~180MB to the image). To change the
-# set, add/remove `&& sandbox-agent install-agent <name>` lines below.
-RUN sandbox-agent install-agent claude && \
-    sandbox-agent install-agent codex && \
-    sandbox-agent install-agent opencode && \
+# Installed in a single layer so the npm download cache AND the de-duplicated
+# engine copies can be removed in the same layer (leaving them behind would add
+# ~570MB to the image: ~180MB npm cache + ~390MB duplicate engines). To change
+# the set, add/remove `sandbox-agent install-agent <name>` lines below.
+#
+# De-dup rationale (see analysis): each agent ships a native CLI (bin/<agent>,
+# used for version reporting and, for opencode, `opencode serve`) AND an ACP
+# adapter (agent_processes/<agent>-acp, spawned for chat sessions). Sourced
+# independently, so the underlying engine lands twice:
+#   - opencode: the ACP adapter is literally `opencode acp`, so the launcher is
+#     repointed at the native binary and the duplicate registry copy is dropped.
+#   - claude:   the adapter's bundled @anthropic-ai engine is the same program as
+#     the native CLI. We keep the NATIVE binary (which install-agent pulls at the
+#     latest release) as the single real copy and symlink the bundled engine to
+#     it, so ACP sessions also run the latest claude.
+#   - codex:    NOT de-duped. codex-acp is a distinct self-contained Rust binary
+#     that embeds its own engine and speaks ACP; the native codex CLI has no `acp`
+#     subcommand and codex-acp has no `--version`, so neither can replace the
+#     other without losing either ACP sessions or version reporting.
+# install-agent (no --version) always pulls the latest release of each agent.
+RUN set -eux; \
+    sandbox-agent install-agent claude; \
+    sandbox-agent install-agent codex; \
+    sandbox-agent install-agent opencode; \
+    BIN="$HOME/.local/share/sandbox-agent/bin"; \
+    AP="$BIN/agent_processes"; \
+    printf '#!/usr/bin/env sh\nset -e\nexec %s/opencode acp "$@"\n' "$BIN" > "$AP/opencode-acp"; \
+    chmod +x "$AP/opencode-acp"; \
+    rm -rf "$AP/opencode"; \
+    SDK_CLAUDE="$(ls -d "$AP"/claude/node_modules/@anthropic-ai/claude-agent-sdk-linux-*/claude)"; \
+    rm -f "$SDK_CLAUDE"; \
+    ln -s "$BIN/claude" "$SDK_CLAUDE"; \
     rm -rf "$HOME/.npm" "$HOME/.cache"
 # Disabled agents (kept for reference; add into the RUN above with `&& \` to enable):
 #   sandbox-agent install-agent amp

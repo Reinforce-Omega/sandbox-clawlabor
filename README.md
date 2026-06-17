@@ -225,7 +225,7 @@ docker run -d -p 2468:2468 \
   server --no-token --host 0.0.0.0 --port 2468
 ```
 
-Then open the Inspector at `http://localhost:2468/ui/`. Tags: `latest`, `base`, `0.1.0`.
+Then open the Inspector at `http://localhost:2468/ui/`. Tags: `latest`, `base`, `0.2.0`.
 
 Mint a long-lived subscription token with `claude setup-token` for `CLAUDE_CODE_OAUTH_TOKEN`, or pass a provider API key (e.g. `ANTHROPIC_API_KEY`) instead.
 
